@@ -1,4 +1,4 @@
-# app.py
+# main.py
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import asyncio
@@ -14,12 +14,27 @@ CORS(app)
 
 nest_asyncio.apply()
 
+# Character URL mapping
+CHARACTER_URLS = {
+    'spongebob': 'https://nicevoice.org/ai-voice-generator/spongebob-squarepants/',
+    'patrick': 'https://nicevoice.org/ai-voice-generator/patrick-star/',
+    'squidward': 'https://nicevoice.org/ai-voice-generator/squidward-tentacles/',
+    'mrkrabs': 'https://nicevoice.org/ai-voice-generator/mr-krabs/'
+}
+
 # Store job status
 jobs = {}
 
-async def generate_voiceover(text, job_id):
-    """Async function to generate voiceover"""
+async def generate_voiceover(text, job_id, character='spongebob'):
+    """Async function to generate voiceover for specified character"""
     try:
+        # Get the URL for the selected character
+        character = character.lower().replace(' ', '')
+        if character not in CHARACTER_URLS:
+            character = 'spongebob'  # Default to SpongeBob if invalid
+        
+        voice_url = CHARACTER_URLS[character]
+        
         async with async_playwright() as p:
             browser = await p.chromium.launch(
                 headless=True,
@@ -30,9 +45,10 @@ async def generate_voiceover(text, job_id):
             
             # Update job status
             jobs[job_id]['status'] = 'processing'
+            jobs[job_id]['character'] = character
             
-            # Navigate to page
-            await page.goto("https://nicevoice.org/ai-voice-generator/spongebob-squarepants/", wait_until="networkidle")
+            # Navigate to character page
+            await page.goto(voice_url, wait_until="networkidle")
             await asyncio.sleep(2)
             
             # Type text in textarea
@@ -73,17 +89,18 @@ async def generate_voiceover(text, job_id):
         jobs[job_id]['status'] = 'failed'
         jobs[job_id]['error'] = str(e)
 
-def run_async_task(text, job_id):
+def run_async_task(text, job_id, character):
     """Run async task in new event loop"""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    loop.run_until_complete(generate_voiceover(text, job_id))
+    loop.run_until_complete(generate_voiceover(text, job_id, character))
     loop.close()
 
-@app.route('/generate', methods=['GET'])
-def generate():
-    """Generate SpongeBob voiceover"""
+@app.route('/generate-and-wait', methods=['GET'])
+def generate_and_wait():
+    """Generate voiceover and wait for completion (synchronous)"""
     text = request.args.get('text', '').strip()
+    character = request.args.get('character', 'spongebob').strip()
     
     if not text:
         return jsonify({
@@ -91,23 +108,81 @@ def generate():
             'error': 'No text provided. Please add ?text=your_text_here'
         }), 400
     
+    # Validate character
+    if character.lower() not in CHARACTER_URLS:
+        return jsonify({
+            'success': False,
+            'error': f'Invalid character. Choose from: {", ".join(CHARACTER_URLS.keys())}'
+        }), 400
+    
+    # Run synchronously (will block until complete)
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {
+        'status': 'pending',
+        'text': text,
+        'character': character,
+        'created_at': datetime.now().isoformat()
+    }
+    
+    # Run the async function synchronously
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(generate_voiceover(text, job_id, character))
+    loop.close()
+    
+    job = jobs[job_id]
+    
+    if job['status'] == 'completed':
+        return jsonify({
+            'success': True,
+            'audio_url': job['audio_url'],
+            'text': text,
+            'character': character
+        })
+    else:
+        return jsonify({
+            'success': False,
+            'error': job.get('error', 'Generation failed')
+        }), 500
+
+@app.route('/generate', methods=['GET'])
+def generate():
+    """Start async voice generation"""
+    text = request.args.get('text', '').strip()
+    character = request.args.get('character', 'spongebob').strip()
+    
+    if not text:
+        return jsonify({
+            'success': False,
+            'error': 'No text provided. Please add ?text=your_text_here'
+        }), 400
+    
+    # Validate character
+    if character.lower() not in CHARACTER_URLS:
+        return jsonify({
+            'success': False,
+            'error': f'Invalid character. Choose from: {", ".join(CHARACTER_URLS.keys())}'
+        }), 400
+    
     # Create job
     job_id = str(uuid.uuid4())
     jobs[job_id] = {
         'status': 'pending',
         'text': text,
+        'character': character,
         'created_at': datetime.now().isoformat()
     }
     
     # Start generation in background thread
-    thread = threading.Thread(target=run_async_task, args=(text, job_id))
+    thread = threading.Thread(target=run_async_task, args=(text, job_id, character))
     thread.daemon = True
     thread.start()
     
     return jsonify({
         'success': True,
         'job_id': job_id,
-        'message': 'Voice generation started',
+        'character': character,
+        'message': f'{character.capitalize()} voice generation started',
         'status_url': f'/status?job_id={job_id}'
     })
 
@@ -130,6 +205,7 @@ def get_status():
             'status': 'completed',
             'audio_url': job['audio_url'],
             'text': job['text'],
+            'character': job['character'],
             'created_at': job['created_at'],
             'completed_at': job.get('completed_at')
         })
@@ -138,54 +214,26 @@ def get_status():
             'success': False,
             'status': 'failed',
             'error': job.get('error', 'Unknown error'),
-            'text': job['text']
+            'text': job['text'],
+            'character': job['character']
         }), 500
     else:
         return jsonify({
             'success': True,
             'status': job['status'],
             'message': 'Still processing... check back soon',
-            'text': job['text']
+            'text': job['text'],
+            'character': job['character']
         })
 
-@app.route('/generate-and-wait', methods=['GET'])
-def generate_and_wait():
-    """Generate voiceover and wait for completion (synchronous)"""
-    text = request.args.get('text', '').strip()
-    
-    if not text:
-        return jsonify({
-            'success': False,
-            'error': 'No text provided. Please add ?text=your_text_here'
-        }), 400
-    
-    # Run synchronously (will block until complete)
-    job_id = str(uuid.uuid4())
-    jobs[job_id] = {
-        'status': 'pending',
-        'text': text,
-        'created_at': datetime.now().isoformat()
-    }
-    
-    # Run the async function synchronously
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(generate_voiceover(text, job_id))
-    loop.close()
-    
-    job = jobs[job_id]
-    
-    if job['status'] == 'completed':
-        return jsonify({
-            'success': True,
-            'audio_url': job['audio_url'],
-            'text': text
-        })
-    else:
-        return jsonify({
-            'success': False,
-            'error': job.get('error', 'Generation failed')
-        }), 500
+@app.route('/characters', methods=['GET'])
+def get_characters():
+    """Get list of available characters"""
+    return jsonify({
+        'success': True,
+        'characters': list(CHARACTER_URLS.keys()),
+        'default': 'spongebob'
+    })
 
 @app.route('/health', methods=['GET'])
 def health():
