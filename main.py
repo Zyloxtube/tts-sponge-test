@@ -9,8 +9,15 @@ from datetime import datetime
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
-import psutil
 import gc
+
+# Try to import psutil for memory monitoring, but don't fail if not available
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+    print("Warning: psutil not installed. Install it with 'pip install psutil' for memory monitoring")
 
 app = Flask(__name__)
 CORS(app)
@@ -194,6 +201,20 @@ async def generate_multiple_voiceovers(texts_and_characters):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] 📈 Batch complete: {success_count}/{len(tasks)} successful")
     
     return results
+
+@app.route('/ping', methods=['GET'])
+def ping():
+    """Simple ping endpoint to check if server is alive"""
+    return jsonify({
+        'success': True,
+        'message': 'pong',
+        'timestamp': datetime.now().isoformat()
+    })
+
+@app.route('/ping-simple', methods=['GET'])
+def ping_simple():
+    """Super simple ping endpoint that returns plain text"""
+    return 'pong', 200, {'Content-Type': 'text/plain'}
 
 @app.route('/generate-batch', methods=['POST'])
 def generate_batch():
@@ -422,15 +443,18 @@ def get_stats():
     with browser_lock:
         current_browsers = active_browsers
     
-    # Get system memory info (requires psutil)
-    try:
-        memory = psutil.virtual_memory()
-        memory_usage = {
-            'total_gb': memory.total / (1024**3),
-            'available_gb': memory.available / (1024**3),
-            'percent_used': memory.percent
-        }
-    except:
+    # Get system memory info
+    if PSUTIL_AVAILABLE:
+        try:
+            memory = psutil.virtual_memory()
+            memory_usage = {
+                'total_gb': round(memory.total / (1024**3), 2),
+                'available_gb': round(memory.available / (1024**3), 2),
+                'percent_used': memory.percent
+            }
+        except:
+            memory_usage = {'error': 'Could not get memory info'}
+    else:
         memory_usage = {'error': 'psutil not installed'}
     
     return jsonify({
@@ -487,6 +511,7 @@ if __name__ == '__main__':
     print(f"📊 Max Concurrent Jobs: 500")
     print(f"💾 Recommended RAM: 32GB+")
     print(f"🔥 Ready to handle massive concurrent requests!")
+    print(f"🏓 Ping endpoint: http://localhost:5000/ping")
     print("=" * 60)
     
     # Run with multiple workers for better concurrency
