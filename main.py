@@ -7,17 +7,8 @@ from playwright.async_api import async_playwright
 import nest_asyncio
 from datetime import datetime
 import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import gc
-
-# Try to import psutil for memory monitoring, but don't fail if not available
-try:
-    import psutil
-    PSUTIL_AVAILABLE = True
-except ImportError:
-    PSUTIL_AVAILABLE = False
-    print("Warning: psutil not installed. Install it with 'pip install psutil' for memory monitoring")
 
 app = Flask(__name__)
 CORS(app)
@@ -36,27 +27,24 @@ CHARACTER_URLS = {
 jobs = {}
 job_lock = threading.Lock()
 
-# Create thread pool for handling multiple requests
-executor = ThreadPoolExecutor(max_workers=600)  # Allow up to 600 concurrent tasks
-
-# Semaphore to control concurrent browser instances
-# MAX 500 CONCURRENT BROWSERS
-browser_semaphore = asyncio.Semaphore(500)  # Allow 500 concurrent browsers
+# Semaphore for concurrent browsers (Render has limited resources)
+# Start with lower concurrency for Render's free tier
+browser_semaphore = asyncio.Semaphore(5)  # Reduced to 5 for Render
 
 # Track active browser count
 active_browsers = 0
 browser_lock = threading.Lock()
 
 async def generate_single_voiceover(text, job_id, character='spongebob'):
-    """Generate a single voiceover with semaphore control (max 500 concurrent)"""
+    """Generate a single voiceover with semaphore control"""
     global active_browsers
     
-    async with browser_semaphore:  # Limit to 500 concurrent browsers
+    async with browser_semaphore:
         with browser_lock:
             active_browsers += 1
             current_active = active_browsers
             
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] 🔄 Job {job_id[:8]} started. Active browsers: {current_active}/500")
+        print(f"Job {job_id[:8]} started. Active browsers: {current_active}/5")
         
         try:
             character = character.lower().replace(' ', '')
@@ -66,7 +54,7 @@ async def generate_single_voiceover(text, job_id, character='spongebob'):
             voice_url = CHARACTER_URLS[character]
             
             async with async_playwright() as p:
-                # Launch with optimized settings for maximum concurrency
+                # Launch with Render-compatible settings
                 browser = await p.chromium.launch(
                     headless=True,
                     args=[
@@ -74,67 +62,34 @@ async def generate_single_voiceover(text, job_id, character='spongebob'):
                         '--disable-setuid-sandbox', 
                         '--disable-dev-shm-usage',
                         '--disable-gpu',
-                        '--disable-software-rasterizer',
-                        '--disable-extensions',
-                        '--disable-background-timer-throttling',
-                        '--disable-backgrounding-occluded-windows',
-                        '--disable-renderer-backgrounding',
-                        '--disable-ipc-flooding-protection',
-                        '--disable-hang-monitor',
-                        '--disable-prompt-on-repost',
-                        '--disable-sync',
-                        '--disable-web-security',
-                        '--aggressive-cache-discard',
-                        '--disable-cache',
-                        '--disable-application-cache',
-                        '--disable-offline-load-stale-cache',
-                        '--disable-gpu-shader-disk-cache',
-                        '--media-cache-size=0',
-                        '--disk-cache-size=0'
+                        '--single-process'  # Helps with memory on Render
                     ]
                 )
                 
-                # Create context with minimal overhead
                 context = await browser.new_context(
-                    viewport={'width': 400, 'height': 300},  # Smaller viewport saves memory
-                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                    java_script_enabled=True,
-                    bypass_csp=True,
-                    ignore_https_errors=True
+                    viewport={'width': 400, 'height': 300}
                 )
                 
                 page = await context.new_page()
                 
-                # Set shorter timeouts for better concurrency
-                page.set_default_timeout(30000)
-                
-                # Update job status
                 with job_lock:
                     jobs[job_id]['status'] = 'processing'
                     jobs[job_id]['character'] = character
                 
-                # Navigate to character page with timeout
-                try:
-                    await page.goto(voice_url, wait_until="domcontentloaded", timeout=30000)
-                    await asyncio.sleep(0.5)  # Reduced sleep time
-                except Exception as e:
-                    print(f"Navigation error for {job_id}: {e}")
-                    raise
+                await page.goto(voice_url, wait_until="domcontentloaded", timeout=30000)
+                await asyncio.sleep(1)
                 
-                # Type text in textarea
                 textarea = await page.query_selector('textarea.textarea')
                 if textarea:
                     await textarea.fill(text)
                 
-                # Click generate button
                 generate_button = await page.query_selector('button.btn-primary:has-text("Generate Voiceover")')
                 if generate_button:
                     await generate_button.click()
                 
-                # Wait for audio URL - checking frequently
                 audio_url = None
                 attempts = 0
-                max_attempts = 120  # 60 seconds total (reduced from 90)
+                max_attempts = 120
                 
                 while attempts < max_attempts:
                     audio_element = await page.query_selector('audio[src*=".mp3"]')
@@ -142,65 +97,29 @@ async def generate_single_voiceover(text, job_id, character='spongebob'):
                         audio_url = await audio_element.get_attribute('src')
                         if audio_url and audio_url.startswith('http'):
                             break
-                    await asyncio.sleep(0.3)  # Check more frequently
+                    await asyncio.sleep(0.5)
                     attempts += 1
                 
                 await browser.close()
-                
-                # Force garbage collection periodically
-                if int(job_id[:2], 16) % 50 == 0:  # Every ~50 jobs
-                    gc.collect()
                 
                 if audio_url:
                     with job_lock:
                         jobs[job_id]['status'] = 'completed'
                         jobs[job_id]['audio_url'] = audio_url
                         jobs[job_id]['completed_at'] = datetime.now().isoformat()
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ Job {job_id[:8]} completed")
                 else:
                     with job_lock:
                         jobs[job_id]['status'] = 'failed'
                         jobs[job_id]['error'] = 'Timeout: Audio generation took too long'
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] ❌ Job {job_id[:8]} timed out")
                     
         except Exception as e:
             with job_lock:
                 jobs[job_id]['status'] = 'failed'
                 jobs[job_id]['error'] = str(e)
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] ❌ Job {job_id[:8]} failed: {str(e)[:100]}")
         
         finally:
             with browser_lock:
                 active_browsers -= 1
-                current_active = active_browsers
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] 📊 Active browsers: {current_active}/500")
-
-async def generate_multiple_voiceovers(texts_and_characters):
-    """Generate multiple voiceovers concurrently (max 500 at once)"""
-    tasks = []
-    
-    # Create all tasks
-    for text, character in texts_and_characters:
-        job_id = str(uuid.uuid4())
-        with job_lock:
-            jobs[job_id] = {
-                'status': 'pending',
-                'text': text,
-                'character': character,
-                'created_at': datetime.now().isoformat()
-            }
-        tasks.append(generate_single_voiceover(text, job_id, character))
-    
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] 🚀 Starting {len(tasks)} concurrent voice generations (max 500)")
-    
-    # Run all tasks concurrently (semaphore will limit to 500)
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    
-    # Count successes and failures
-    success_count = sum(1 for r in results if r is None)
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] 📈 Batch complete: {success_count}/{len(tasks)} successful")
-    
-    return results
 
 @app.route('/ping', methods=['GET'])
 def ping():
@@ -215,98 +134,6 @@ def ping():
 def ping_simple():
     """Super simple ping endpoint that returns plain text"""
     return 'pong', 200, {'Content-Type': 'text/plain'}
-
-@app.route('/generate-batch', methods=['POST'])
-def generate_batch():
-    """Generate multiple voiceovers at once (max 2000 per batch)"""
-    data = request.json
-    
-    if not data or 'requests' not in data:
-        return jsonify({
-            'success': False,
-            'error': 'Please provide a list of requests with text and character'
-        }), 400
-    
-    requests_list = data['requests']
-    
-    if len(requests_list) > 2000:
-        return jsonify({
-            'success': False,
-            'error': 'Maximum 2000 requests per batch'
-        }), 400
-    
-    # Prepare texts and characters
-    texts_and_characters = []
-    job_ids = []
-    
-    for req in requests_list:
-        text = req.get('text', '').strip()
-        character = req.get('character', 'spongebob').strip()
-        
-        if not text:
-            continue
-            
-        if character.lower() not in CHARACTER_URLS:
-            character = 'spongebob'
-            
-        texts_and_characters.append((text, character))
-        job_id = str(uuid.uuid4())
-        job_ids.append(job_id)
-        
-        with job_lock:
-            jobs[job_id] = {
-                'status': 'pending',
-                'text': text,
-                'character': character,
-                'created_at': datetime.now().isoformat()
-            }
-    
-    # Run async generation in background
-    def run_async_batch():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(generate_multiple_voiceovers(texts_and_characters))
-        loop.close()
-    
-    # Start batch processing in background
-    thread = threading.Thread(target=run_async_batch)
-    thread.daemon = True
-    thread.start()
-    
-    return jsonify({
-        'success': True,
-        'batch_id': str(uuid.uuid4()),
-        'job_ids': job_ids,
-        'total_jobs': len(job_ids),
-        'max_concurrent': 500,
-        'message': f'Started {len(job_ids)} voice generations (max 500 running at once)',
-        'estimated_time': f'~{max(30, len(job_ids) // 10)} seconds'
-    })
-
-@app.route('/generate-500-sounds', methods=['POST'])
-def generate_500_sounds():
-    """Convenience endpoint to generate exactly 500 sounds"""
-    data = request.json
-    
-    if not data or 'texts' not in data:
-        return jsonify({
-            'success': False,
-            'error': 'Please provide 500 texts in the "texts" array'
-        }), 400
-    
-    texts = data['texts']
-    character = data.get('character', 'spongebob')
-    
-    if len(texts) != 500:
-        return jsonify({
-            'success': False,
-            'error': f'Please provide exactly 500 texts, got {len(texts)}'
-        }), 400
-    
-    # Create 500 requests
-    requests_list = [{'text': text, 'character': character} for text in texts]
-    
-    return generate_batch()
 
 @app.route('/generate', methods=['GET'])
 def generate():
@@ -336,7 +163,6 @@ def generate():
             'created_at': datetime.now().isoformat()
         }
     
-    # Run single generation in background
     def run_async_single():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -351,7 +177,6 @@ def generate():
         'success': True,
         'job_id': job_id,
         'character': character,
-        'max_concurrent': 500,
         'message': f'{character.capitalize()} voice generation started',
         'status_url': f'/status?job_id={job_id}'
     })
@@ -397,84 +222,6 @@ def get_status():
             'character': job['character']
         })
 
-@app.route('/batch-status', methods=['POST'])
-def batch_status():
-    """Get status for multiple jobs at once"""
-    data = request.json
-    
-    if not data or 'job_ids' not in data:
-        return jsonify({
-            'success': False,
-            'error': 'Please provide job_ids array'
-        }), 400
-    
-    job_ids = data['job_ids']
-    results = {}
-    
-    with job_lock:
-        for job_id in job_ids:
-            if job_id in jobs:
-                job = jobs[job_id].copy()
-                results[job_id] = {
-                    'status': job['status'],
-                    'text': job['text'],
-                    'character': job['character']
-                }
-                if job['status'] == 'completed':
-                    results[job_id]['audio_url'] = job['audio_url']
-                elif job['status'] == 'failed':
-                    results[job_id]['error'] = job.get('error')
-    
-    return jsonify({
-        'success': True,
-        'results': results
-    })
-
-@app.route('/stats', methods=['GET'])
-def get_stats():
-    """Get system statistics"""
-    with job_lock:
-        total_jobs = len(jobs)
-        completed_jobs = len([j for j in jobs.values() if j['status'] == 'completed'])
-        failed_jobs = len([j for j in jobs.values() if j['status'] == 'failed'])
-        processing_jobs = len([j for j in jobs.values() if j['status'] == 'processing'])
-        pending_jobs = len([j for j in jobs.values() if j['status'] == 'pending'])
-    
-    with browser_lock:
-        current_browsers = active_browsers
-    
-    # Get system memory info
-    if PSUTIL_AVAILABLE:
-        try:
-            memory = psutil.virtual_memory()
-            memory_usage = {
-                'total_gb': round(memory.total / (1024**3), 2),
-                'available_gb': round(memory.available / (1024**3), 2),
-                'percent_used': memory.percent
-            }
-        except:
-            memory_usage = {'error': 'Could not get memory info'}
-    else:
-        memory_usage = {'error': 'psutil not installed'}
-    
-    return jsonify({
-        'success': True,
-        'jobs': {
-            'total': total_jobs,
-            'completed': completed_jobs,
-            'failed': failed_jobs,
-            'processing': processing_jobs,
-            'pending': pending_jobs
-        },
-        'concurrent': {
-            'max_allowed': 500,
-            'currently_active': current_browsers,
-            'available_slots': 500 - current_browsers
-        },
-        'system_memory': memory_usage,
-        'timestamp': datetime.now().isoformat()
-    })
-
 @app.route('/characters', methods=['GET'])
 def get_characters():
     """Get list of available characters"""
@@ -490,29 +237,24 @@ def health():
     with job_lock:
         active_jobs = len([j for j in jobs.values() if j['status'] == 'processing'])
     
-    with browser_lock:
-        current_browsers = active_browsers
-    
     return jsonify({
         'status': 'healthy',
         'active_jobs': active_jobs,
-        'max_concurrent': 500,
-        'active_browsers': current_browsers,
+        'max_concurrent': 5,
         'total_jobs_processed': len(jobs)
     })
 
 if __name__ == '__main__':
-    # Install playwright browsers if needed
-    os.system('playwright install chromium')
+    # Get port from environment variable (Render sets this)
+    port = int(os.environ.get('PORT', 10000))
     
     print("=" * 60)
-    print("🚀 Voice Generation Server Starting")
+    print("🚀 Voice Generation Server Starting on Render")
     print("=" * 60)
-    print(f"📊 Max Concurrent Jobs: 500")
-    print(f"💾 Recommended RAM: 32GB+")
-    print(f"🔥 Ready to handle massive concurrent requests!")
-    print(f"🏓 Ping endpoint: http://localhost:5000/ping")
+    print(f"📊 Max Concurrent Jobs: 5 (Render optimized)")
+    print(f"🏓 Ping endpoint: /ping")
+    print(f"🌐 Server will bind to 0.0.0.0:{port}")
     print("=" * 60)
     
-    # Run with multiple workers for better concurrency
-    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True, processes=4)
+    # Bind to 0.0.0.0 and Render's PORT
+    app.run(host='0.0.0.0', port=port, debug=False)
